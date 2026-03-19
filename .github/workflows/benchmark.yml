@@ -1,0 +1,104 @@
+name: Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "runs per case"
+        type: choice
+        default: "5"
+        options: ["3", "5", "10"]
+
+      cases:
+        description: "case ids (comma-separated, or 'all')"
+        type: string
+        default: "all"
+
+      target:
+        description: "which build to benchmark"
+        type: choice
+        default: "both"
+        options: ["current", "compare", "both"]
+
+      compare_repo:
+        description: "external repo (owner/repo)"
+        type: string
+        default: "conda-incubator/condastats"
+
+      compare_ref:
+        description: "branch, tag or SHA of external repo"
+        type: string
+        default: "main"
+
+      python_version:
+        description: "python version"
+        type: choice
+        default: "3.12"
+        options: ["3.10", "3.11", "3.12", "3.13"]
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - id: build
+        run: |
+          TARGET="${{ github.event.inputs.target }}"
+          if   [ "$TARGET" = "current" ]; then LEGS='["current"]'
+          elif [ "$TARGET" = "compare" ]; then LEGS='["compare"]'
+          else                                 LEGS='["current","compare"]'
+          fi
+          echo "matrix={\"leg\":$LEGS}" >> "$GITHUB_OUTPUT"
+
+  benchmark:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    name: benchmark (${{ matrix.leg }})
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: ${{ github.event.inputs.python_version }}
+
+      - name: Install from PyPI (current)
+        if: matrix.leg == 'current'
+        run: |
+          uv venv .venv
+          uv pip install --python .venv/bin/python \
+            condastats psutil
+
+      - name: Checkout, build and install from source (compare)
+        if: matrix.leg == 'compare'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.compare_repo }}
+          ref: ${{ github.event.inputs.compare_ref }}
+          path: compare_src
+
+      - name: Build and install wheel (compare)
+        if: matrix.leg == 'compare'
+        run: |
+          uv build --wheel --project compare_src --out-dir dist/
+          uv venv .venv
+          uv pip install --python .venv/bin/python \
+            dist/*.whl psutil
+
+      - name: Run benchmark
+        run: |
+          .venv/bin/python scripts/benchmark.py \
+            --runs   "${{ github.event.inputs.runs }}"  \
+            --cases  "${{ github.event.inputs.cases }}" \
+            --label  "${{ matrix.leg }}"                \
+            --outdir results/
+
+      - name: Upload JSON artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.leg }}-${{ github.sha }}
+          path: results/results_${{ matrix.leg }}.json
